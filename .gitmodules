@@ -1,0 +1,4 @@
+[submodule "third_party/ai-toolkit"]
+	path = third_party/ai-toolkit
+	url = https://github.com/ifilipis/ai-toolkit.git
+	branch = rlhf

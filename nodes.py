@@ -19,10 +19,14 @@ from PIL import Image
 import folder_paths
 from server import PromptServer
 
+_NODE_ROOT = Path(__file__).resolve().parent
+_THIRD_PARTY_AITK_ROOT = _NODE_ROOT / "third_party" / "ai-toolkit"
+_PROMPT_SERVER_INSTANCE = getattr(PromptServer, "instance", None)
+
 
 def _ensure_aitk_path() -> None:
     ai_toolkit_root = Path(
-        os.environ.get("AITK_ROOT", "/content/ai-toolkit-fork")
+        os.environ.get("AITK_ROOT", str(_THIRD_PARTY_AITK_ROOT))
     ).resolve()
     if ai_toolkit_root.exists() and str(ai_toolkit_root) not in sys.path:
         sys.path.insert(0, str(ai_toolkit_root))
@@ -57,12 +61,16 @@ def _raise_if_unavailable() -> None:
 _AITK_UI_OPTIONS_PATH = Path(
     os.environ.get(
         "AITK_UI_MODEL_OPTIONS_PATH",
-        "/content/ai-toolkit-fork/ui/src/app/jobs/new/options.ts",
+        str(_THIRD_PARTY_AITK_ROOT / "ui" / "src" / "app" / "jobs" / "new" / "options.ts"),
     )
 ).resolve()
 _MODEL_PRESET_LOCK = threading.Lock()
 _MODEL_PRESET_CACHE: dict[str, dict[str, Any]] | None = None
 _TRISTATE_BOOL = ["auto", "true", "false"]
+_KNOWN_JS_IDENTIFIERS: dict[str, Any] = {
+    "defaultNameOrPath": "",
+    "defaultLinearRank": 32,
+}
 
 
 def _tristate_to_optional_bool(value: str) -> bool | None:
@@ -159,10 +167,69 @@ def _first_js_list_item(list_literal: str) -> str:
     return inner.strip()
 
 
+def _split_js_list_items(list_literal: str) -> list[str]:
+    content = list_literal.strip()
+    if not content.startswith("[") or not content.endswith("]"):
+        return [content]
+
+    inner = content[1:-1].strip()
+    if not inner:
+        return []
+
+    items: list[str] = []
+    depth_curly = 0
+    depth_square = 0
+    depth_paren = 0
+    quote = ""
+    in_string = False
+    escaped = False
+    start = 0
+
+    for idx, ch in enumerate(inner):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                in_string = False
+            continue
+
+        if ch in {"'", '"', "`"}:
+            in_string = True
+            quote = ch
+            continue
+
+        if ch == "{":
+            depth_curly += 1
+        elif ch == "}":
+            depth_curly -= 1
+        elif ch == "[":
+            depth_square += 1
+        elif ch == "]":
+            depth_square -= 1
+        elif ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            depth_paren -= 1
+        elif ch == "," and depth_curly == 0 and depth_square == 0 and depth_paren == 0:
+            item = inner[start:idx].strip()
+            if item:
+                items.append(item)
+            start = idx + 1
+
+    tail = inner[start:].strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
 def _parse_js_literal(value: str) -> Any:
     text = str(value or "").strip()
     if text == "":
         return None
+    if text in _KNOWN_JS_IDENTIFIERS:
+        return _KNOWN_JS_IDENTIFIERS[text]
     if text in {"undefined", "null"}:
         return None
     if text == "true":
@@ -198,9 +265,9 @@ def _parse_js_literal(value: str) -> Any:
         return text
 
 
-def _extract_model_defaults(defaults_text: str) -> dict[str, Any]:
+def _extract_model_default_pairs(defaults_text: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    prefix = "'config.process[0].model."
+    prefix = "'config.process[0]."
     cursor = 0
     while True:
         key_start = defaults_text.find(prefix, cursor)
@@ -228,11 +295,35 @@ def _extract_model_defaults(defaults_text: str) -> dict[str, Any]:
             cursor = list_start + 1
             continue
 
-        first_item_literal = _first_js_list_item(list_literal)
-        out[key] = _parse_js_literal(first_item_literal)
+        out[key] = [_parse_js_literal(item) for item in _split_js_list_items(list_literal)]
         cursor = next_idx
 
     return out
+
+
+def _extract_model_defaults(defaults_text: str) -> dict[str, Any]:
+    selected_defaults: dict[str, Any] = {}
+    for key, value in _extract_model_default_pairs(defaults_text).items():
+        if isinstance(value, list) and value:
+            selected_defaults[key] = value[0]
+        else:
+            selected_defaults[key] = value
+    return selected_defaults
+
+
+def _extract_js_key_literal(block: str, key: str, open_char: str, close_char: str) -> Any:
+    marker = f"{key}:"
+    marker_idx = block.find(marker)
+    if marker_idx < 0:
+        return None
+    literal_start = block.find(open_char, marker_idx)
+    if literal_start < 0:
+        return None
+    try:
+        literal_text, _ = _extract_balanced(block, literal_start, open_char, close_char)
+    except ValueError:
+        return None
+    return _parse_js_literal(literal_text)
 
 
 def _load_aitk_ui_model_presets() -> dict[str, dict[str, Any]]:
@@ -257,7 +348,7 @@ def _load_aitk_ui_model_presets() -> dict[str, dict[str, Any]]:
                 _MODEL_PRESET_CACHE = presets
                 return presets
 
-            array_start = content.find("[", marker_idx)
+            array_start = content.find("[", marker_idx + len(marker) - 1)
             model_archs_array, _ = _extract_balanced(content, array_start, "[", "]")
             array_body = model_archs_array[1:-1]
 
@@ -275,17 +366,50 @@ def _load_aitk_ui_model_presets() -> dict[str, dict[str, Any]]:
                 name = name_match.group(1).strip()
                 label_match = re.search(r"\blabel\s*:\s*'([^']+)'", block)
                 label = label_match.group(1).strip() if label_match else name
+                group_match = re.search(r"\bgroup\s*:\s*'([^']+)'", block)
+                group = group_match.group(1).strip() if group_match else "image"
 
-                preset: dict[str, Any] = {"label": label, "arch": name}
+                preset: dict[str, Any] = {
+                    "label": label,
+                    "group": group,
+                    "arch": name,
+                }
+
+                disable_sections = _extract_js_key_literal(block, "disableSections", "[", "]")
+                if isinstance(disable_sections, list):
+                    preset["disableSections"] = disable_sections
+
+                additional_sections = _extract_js_key_literal(block, "additionalSections", "[", "]")
+                if isinstance(additional_sections, list):
+                    preset["additionalSections"] = additional_sections
+
+                accuracy_recovery_adapters = _extract_js_key_literal(
+                    block,
+                    "accuracyRecoveryAdapters",
+                    "{",
+                    "}",
+                )
+                if isinstance(accuracy_recovery_adapters, dict):
+                    preset["accuracyRecoveryAdapters"] = accuracy_recovery_adapters
 
                 defaults_idx = block.find("defaults:")
                 if defaults_idx >= 0:
                     defaults_start = block.find("{", defaults_idx)
                     if defaults_start >= 0:
                         defaults_obj, _ = _extract_balanced(block, defaults_start, "{", "}")
-                        defaults = _extract_model_defaults(defaults_obj)
-                        for key, value in defaults.items():
+                        default_pairs = _extract_model_default_pairs(defaults_obj)
+                        preset["defaults"] = default_pairs
+                        for key, value in _extract_model_defaults(defaults_obj).items():
                             preset[key] = value
+                            if key.startswith("model."):
+                                preset[key.split("model.", 1)[1]] = value
+
+                if "name_or_path" not in preset:
+                    preset["name_or_path"] = ""
+                if "qtype" not in preset:
+                    preset["qtype"] = "qfloat8"
+                if "qtype_te" not in preset:
+                    preset["qtype_te"] = "qfloat8"
 
                 presets[name] = preset
         except Exception:
@@ -432,7 +556,356 @@ def _save_temp_images(images: torch.Tensor, filename_prefix: str = "AITKVotePrev
     return results
 
 
-@PromptServer.instance.routes.post("/aitk_rlhf/vote")
+def _deep_copy_jsonable(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return bool(value) if value is not None else default
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _set_nested_process_value(target: dict[str, Any], path: str, value: Any) -> None:
+    parts = [part for part in str(path or "").split(".") if part]
+    if not parts:
+        return
+    if any("[" in part or "]" in part for part in parts):
+        return
+    cursor: Any = target
+    for part in parts[:-1]:
+        next_cursor = cursor.get(part)
+        if not isinstance(next_cursor, dict):
+            next_cursor = {}
+            cursor[part] = next_cursor
+        cursor = next_cursor
+    cursor[parts[-1]] = value
+
+
+def _default_model_arch_name() -> str:
+    preset_names = [name for name in _model_preset_names() if name != "custom"]
+    if "sd15" in preset_names:
+        return "sd15"
+    return preset_names[0] if preset_names else "sd15"
+
+
+def _apply_preset_defaults_to_process(process: dict[str, Any], preset_name: str) -> None:
+    presets = _load_aitk_ui_model_presets()
+    preset = presets.get(preset_name, {})
+    defaults = preset.get("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+
+    for path, pair in defaults.items():
+        if not isinstance(path, str) or not path:
+            continue
+        if path.startswith("datasets[") or path.startswith("sample.") or path.startswith("slider."):
+            continue
+        selected_value = pair[0] if isinstance(pair, list) and len(pair) > 0 else pair
+        _set_nested_process_value(process, path, selected_value)
+
+    model = process.setdefault("model", {})
+    if isinstance(model, dict):
+        model["arch"] = preset_name
+        model.setdefault("name_or_path", preset.get("name_or_path", ""))
+        model.setdefault("qtype", preset.get("qtype", "qfloat8"))
+        model.setdefault("qtype_te", preset.get("qtype_te", "qfloat8"))
+        model.setdefault("model_kwargs", {})
+        model.setdefault("low_vram", False)
+
+
+def _default_session_ui_state() -> dict[str, Any]:
+    default_arch = _default_model_arch_name()
+    state: dict[str, Any] = {
+        "job_config": {
+            "job": "extension",
+            "config": {
+                "name": "aitk-session-1",
+                "process": [
+                    {
+                        "type": "diffusion_trainer",
+                        "network": {
+                            "type": "lora",
+                            "linear": 32,
+                            "linear_alpha": 32,
+                            "conv": 16,
+                            "conv_alpha": 16,
+                            "lokr_full_rank": True,
+                            "lokr_factor": -1,
+                            "dropout": 0.0,
+                            "network_kwargs": {
+                                "ignore_if_contains": [],
+                            },
+                        },
+                        "save": {
+                            "dtype": "bf16",
+                            "save_every": 25,
+                            "max_step_saves_to_keep": 4,
+                            "save_format": "diffusers",
+                            "push_to_hub": False,
+                        },
+                        "train": {
+                            "optimizer": "adamw",
+                            "lr": 1e-4,
+                            "optimizer_params": {
+                                "weight_decay": 1e-4,
+                            },
+                            "switch_boundary_every": 1,
+                        },
+                        "model": {
+                            "arch": default_arch,
+                            "name_or_path": "",
+                            "extras_name_or_path": "",
+                            "quantize": False,
+                            "qtype": "qfloat8",
+                            "quantize_te": False,
+                            "qtype_te": "qfloat8",
+                            "low_vram": False,
+                            "layer_offloading": False,
+                            "layer_offloading_transformer_percent": 1.0,
+                            "layer_offloading_text_encoder_percent": 1.0,
+                            "assistant_lora_path": "",
+                            "accuracy_recovery_adapter": "",
+                            "model_kwargs": {},
+                        },
+                    }
+                ],
+            },
+            "meta": {
+                "name": "[name]",
+                "version": "1.0",
+            },
+        },
+        "runtime": {
+            "device": "cuda",
+            "dtype": "fp16",
+            "checkpoint_root": str(_THIRD_PARTY_AITK_ROOT / "output" / "aitk_flow_grpo"),
+            "resume": True,
+        },
+        "grpo": {
+            "clip_range": 1e-4,
+            "adv_clip_max": 5.0,
+            "beta": 0.0,
+            "noise_level": 0.7,
+            "sde_type": "sde",
+            "timestep_fraction": 1.0,
+        },
+    }
+    process = state["job_config"]["config"]["process"][0]
+    _apply_preset_defaults_to_process(process, default_arch)
+    return state
+
+
+def _session_ui_schema() -> dict[str, Any]:
+    presets = _load_aitk_ui_model_presets()
+    model_archs: list[dict[str, Any]] = []
+    for name, preset in presets.items():
+        if name == "custom":
+            continue
+        model_archs.append(
+            {
+                "name": name,
+                "label": preset.get("label", name),
+                "group": preset.get("group", "image"),
+                "defaults": preset.get("defaults", {}),
+                "disableSections": preset.get("disableSections", []),
+                "additionalSections": preset.get("additionalSections", []),
+                "accuracyRecoveryAdapters": preset.get("accuracyRecoveryAdapters", {}),
+            }
+        )
+
+    model_archs.sort(key=lambda item: str(item.get("label", "")).lower())
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for item in model_archs:
+        group = str(item.get("group", "image"))
+        grouped.setdefault(group, []).append({"value": item["name"], "label": item["label"]})
+
+    grouped_model_options = [
+        {"label": group, "options": options}
+        for group, options in sorted(grouped.items(), key=lambda pair: pair[0].lower())
+    ]
+
+    return {
+        "default_state": _default_session_ui_state(),
+        "default_model_arch": _default_model_arch_name(),
+        "model_archs": model_archs,
+        "grouped_model_options": grouped_model_options,
+        "quantization_options": [
+            {"value": "", "label": "- NONE -"},
+            {"value": "qfloat8", "label": "float8 (default)"},
+            {"value": "uint7", "label": "7 bit"},
+            {"value": "uint6", "label": "6 bit"},
+            {"value": "uint5", "label": "5 bit"},
+            {"value": "uint4", "label": "4 bit"},
+            {"value": "uint3", "label": "3 bit"},
+            {"value": "uint2", "label": "2 bit"},
+        ],
+        "default_qtype": "qfloat8",
+        "network_type_options": [
+            {"value": "lora", "label": "LoRA"},
+            {"value": "lokr", "label": "LoKr"},
+        ],
+        "dtype_options": [
+            {"value": "bf16", "label": "BF16"},
+            {"value": "fp16", "label": "FP16"},
+            {"value": "fp32", "label": "FP32"},
+        ],
+        "optimizer_options": [
+            {"value": "adamw", "label": "AdamW"},
+        ],
+        "sde_type_options": [
+            {"value": "sde", "label": "SDE"},
+            {"value": "cps", "label": "CPS"},
+        ],
+    }
+
+
+def _build_session_config_from_ui_state(session_id: str, ui_state: dict[str, Any]) -> SessionConfig:
+    job_config = ui_state.get("job_config", {}) if isinstance(ui_state, dict) else {}
+    runtime = ui_state.get("runtime", {}) if isinstance(ui_state, dict) else {}
+    grpo_state = ui_state.get("grpo", {}) if isinstance(ui_state, dict) else {}
+
+    process_list = (((job_config.get("config") or {}).get("process")) or []) if isinstance(job_config, dict) else []
+    process = process_list[0] if process_list else {}
+    if not isinstance(process, dict):
+        process = {}
+
+    model = process.get("model", {})
+    if not isinstance(model, dict):
+        model = {}
+    network = process.get("network", {})
+    if not isinstance(network, dict):
+        network = {}
+    save = process.get("save", {})
+    if not isinstance(save, dict):
+        save = {}
+    train = process.get("train", {})
+    if not isinstance(train, dict):
+        train = {}
+    optimizer_params = train.get("optimizer_params", {})
+    if not isinstance(optimizer_params, dict):
+        optimizer_params = {}
+    model_kwargs = model.get("model_kwargs", {})
+    if not isinstance(model_kwargs, dict):
+        model_kwargs = {}
+
+    model_arch = str(model.get("arch", _default_model_arch_name()) or _default_model_arch_name()).strip()
+    model_name = str(model.get("name_or_path", "") or "").strip()
+    if not model_name:
+        preset = _load_aitk_ui_model_presets().get(model_arch, {})
+        model_name = str(preset.get("name_or_path", "") or "").strip()
+    if not model_name:
+        raise ValueError("Model name is required for the selected model architecture.")
+
+    model_config_overrides: dict[str, Any] = {
+        "arch": model_arch,
+        "name_or_path": model_name,
+        "quantize": _coerce_bool(model.get("quantize"), False),
+        "quantize_te": _coerce_bool(model.get("quantize_te"), False),
+        "qtype": str(model.get("qtype", "qfloat8") or "qfloat8"),
+        "qtype_te": str(model.get("qtype_te", "qfloat8") or "qfloat8"),
+        "low_vram": _coerce_bool(model.get("low_vram"), False),
+        "layer_offloading": _coerce_bool(model.get("layer_offloading"), False),
+    }
+    extras_name_or_path = str(model.get("extras_name_or_path", "") or "").strip()
+    if extras_name_or_path:
+        model_config_overrides["extras_name_or_path"] = extras_name_or_path
+    assistant_lora_path = str(model.get("assistant_lora_path", "") or "").strip()
+    if assistant_lora_path:
+        model_config_overrides["assistant_lora_path"] = assistant_lora_path
+    accuracy_recovery_adapter = str(model.get("accuracy_recovery_adapter", "") or "").strip()
+    if accuracy_recovery_adapter:
+        model_config_overrides["accuracy_recovery_adapter"] = accuracy_recovery_adapter
+    if model_config_overrides["layer_offloading"]:
+        model_config_overrides["layer_offloading_transformer_percent"] = _coerce_float(
+            model.get("layer_offloading_transformer_percent"),
+            1.0,
+        )
+        model_config_overrides["layer_offloading_text_encoder_percent"] = _coerce_float(
+            model.get("layer_offloading_text_encoder_percent"),
+            1.0,
+        )
+
+    return SessionConfig(
+        session_id=session_id,
+        model_arch=model_arch,
+        model_name=model_name,
+        model_extras_name_or_path=extras_name_or_path or None,
+        model_kwargs=_deep_copy_jsonable(model_kwargs),
+        model_paths={},
+        model_config_overrides=model_config_overrides,
+        device=str(runtime.get("device", "cuda") or "cuda"),
+        dtype=str(runtime.get("dtype", save.get("dtype", "fp16")) or "fp16"),  # type: ignore[arg-type]
+        seed=0,
+        checkpoint_root=str(
+            runtime.get("checkpoint_root", str(_THIRD_PARTY_AITK_ROOT / "output" / "aitk_flow_grpo"))
+            or str(_THIRD_PARTY_AITK_ROOT / "output" / "aitk_flow_grpo")
+        ),
+        checkpoint_interval_steps=_coerce_int(save.get("save_every"), 25),
+        checkpoint_dtype=str(save.get("dtype", "fp16") or "fp16"),  # type: ignore[arg-type]
+        max_checkpoints=_coerce_int(save.get("max_step_saves_to_keep"), 4),
+        resume=_coerce_bool(runtime.get("resume"), True),
+        lora=LoRAConfigSpec(
+            enabled=True,
+            network_type=str(network.get("type", "lora") or "lora"),  # type: ignore[arg-type]
+            rank=_coerce_int(network.get("linear"), 32),
+            alpha=_coerce_int(network.get("linear_alpha", network.get("linear")), 32),
+            conv_rank=(
+                _coerce_int(network.get("conv"), 0)
+                if network.get("conv") is not None
+                else None
+            ),
+            conv_alpha=(
+                _coerce_float(network.get("conv_alpha"), 0.0)
+                if network.get("conv_alpha") is not None
+                else None
+            ),
+            dropout=_coerce_float(network.get("dropout"), 0.0),
+            lokr_full_rank=_coerce_bool(network.get("lokr_full_rank"), True),
+            lokr_factor=_coerce_int(network.get("lokr_factor"), -1),
+            network_kwargs=_deep_copy_jsonable(network.get("network_kwargs", {})),
+            lora_path=None,
+        ),
+        optimizer=OptimizerConfig(
+            optimizer="adamw",
+            learning_rate=_coerce_float(train.get("lr"), 1e-4),
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_weight_decay=_coerce_float(optimizer_params.get("weight_decay"), 1e-4),
+            adam_epsilon=1e-8,
+            max_grad_norm=1.0,
+        ),
+        grpo=GRPOConfig(
+            clip_range=_coerce_float(grpo_state.get("clip_range"), 1e-4),
+            adv_clip_max=_coerce_float(grpo_state.get("adv_clip_max"), 5.0),
+            beta=_coerce_float(grpo_state.get("beta"), 0.0),
+            noise_level=_coerce_float(grpo_state.get("noise_level"), 0.7),
+            sde_type=str(grpo_state.get("sde_type", "sde") or "sde"),  # type: ignore[arg-type]
+            timestep_fraction=_coerce_float(grpo_state.get("timestep_fraction"), 1.0),
+        ),
+    )
+
+
 async def aitk_rlhf_vote_route(request):
     _raise_if_unavailable()
     body = await request.json()
@@ -543,7 +1016,6 @@ async def aitk_rlhf_vote_route(request):
         return web.json_response({"error": f"Unexpected error: {error}"}, status=500)
 
 
-@PromptServer.instance.routes.get("/aitk_rlhf/logs")
 async def aitk_rlhf_logs_route(request):
     node_id = str(request.rel_url.query.get("node_id", "")).strip()
     session_id = str(request.rel_url.query.get("session_id", "")).strip()
@@ -590,130 +1062,30 @@ async def aitk_rlhf_logs_route(request):
     return web.json_response(response)
 
 
+async def aitk_rlhf_ui_schema_route(request):
+    return web.json_response({"ok": True, "schema": _session_ui_schema()})
+
+
+if _PROMPT_SERVER_INSTANCE is not None:
+    _PROMPT_SERVER_INSTANCE.routes.post("/aitk_rlhf/vote")(aitk_rlhf_vote_route)
+    _PROMPT_SERVER_INSTANCE.routes.get("/aitk_rlhf/logs")(aitk_rlhf_logs_route)
+    _PROMPT_SERVER_INSTANCE.routes.get("/aitk_rlhf/ui_schema")(aitk_rlhf_ui_schema_route)
+
+
 class AITKRLHFSession:
     @classmethod
     def INPUT_TYPES(cls):
-        model_preset_options = _model_preset_names()
-        if not model_preset_options:
-            model_preset_options = ["custom"]
-        default_model_preset = "sd15" if "sd15" in model_preset_options else model_preset_options[0]
-
         return {
             "required": {
                 "session_id": ("STRING", {"default": "aitk-session-1"}),
-                "model_preset": (model_preset_options, {"default": default_model_preset}),
-                "use_preset_defaults": ("BOOLEAN", {"default": True}),
-                "model_arch": ("STRING", {"default": "sd15"}),
-                "model_name": (
+                "config_json": (
                     "STRING",
-                    {"default": "stable-diffusion-v1-5/stable-diffusion-v1-5"},
+                    {
+                        "default": json.dumps(_default_session_ui_state(), ensure_ascii=True),
+                        "multiline": True,
+                    },
                 ),
-                "model_extras_name_or_path": ("STRING", {"default": ""}),
-                "model_quantize": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_quantize_te": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_qtype": ("STRING", {"default": ""}),
-                "model_qtype_te": ("STRING", {"default": ""}),
-                "model_low_vram": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_layer_offloading": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_layer_offloading_transformer_percent": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
-                ),
-                "model_layer_offloading_text_encoder_percent": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
-                ),
-                "model_attn_masking": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_split_model_over_gpus": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_assistant_lora_path": ("STRING", {"default": ""}),
-                "model_accuracy_recovery_adapter": ("STRING", {"default": ""}),
-                "model_match_target_res": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_train_high_noise": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_train_low_noise": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_do_random_inpainting": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_random_blur_mask": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_random_dialate_mask": (_TRISTATE_BOOL, {"default": "auto"}),
-                "model_invert_inpaint_mask_chance": (
-                    "FLOAT",
-                    {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01},
-                ),
-                "model_inpaint_dropout": (
-                    "FLOAT",
-                    {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01},
-                ),
-                "model_control_dropout": (
-                    "FLOAT",
-                    {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01},
-                ),
-                "model_inpaint_random_chance": (
-                    "FLOAT",
-                    {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01},
-                ),
-                "device": ("STRING", {"default": "cuda"}),
-                "dtype": (["fp16", "bf16", "fp32"], {"default": "fp16"}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
-                "checkpoint_root": (
-                    "STRING",
-                    {"default": "/content/ai-toolkit-fork/output/aitk_flow_grpo"},
-                ),
-                "checkpoint_interval_steps": (
-                    "INT",
-                    {"default": 25, "min": 1, "max": 1000000},
-                ),
-                "resume": ("BOOLEAN", {"default": True}),
                 "force_reset": ("BOOLEAN", {"default": False}),
-                "lora_rank": ("INT", {"default": 32, "min": 1, "max": 1024}),
-                "lora_alpha": ("INT", {"default": 64, "min": 1, "max": 4096}),
-                "lora_dropout": (
-                    "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001},
-                ),
-                "lora_path": ("STRING", {"default": ""}),
-                "learning_rate": (
-                    "FLOAT",
-                    {"default": 1e-4, "min": 1e-7, "max": 1.0, "step": 1e-6},
-                ),
-                "adam_beta1": (
-                    "FLOAT",
-                    {"default": 0.9, "min": 0.0, "max": 0.9999, "step": 0.0001},
-                ),
-                "adam_beta2": (
-                    "FLOAT",
-                    {"default": 0.999, "min": 0.0, "max": 0.999999, "step": 0.000001},
-                ),
-                "adam_weight_decay": (
-                    "FLOAT",
-                    {"default": 1e-4, "min": 0.0, "max": 1.0, "step": 1e-6},
-                ),
-                "adam_epsilon": (
-                    "FLOAT",
-                    {"default": 1e-8, "min": 1e-12, "max": 1e-2, "step": 1e-10},
-                ),
-                "max_grad_norm": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01},
-                ),
-                "grpo_clip_range": (
-                    "FLOAT",
-                    {"default": 1e-4, "min": 1e-8, "max": 1.0, "step": 1e-6},
-                ),
-                "grpo_adv_clip_max": (
-                    "FLOAT",
-                    {"default": 5.0, "min": 0.1, "max": 1000.0, "step": 0.1},
-                ),
-                "grpo_beta": (
-                    "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.001},
-                ),
-                "grpo_noise_level": (
-                    "FLOAT",
-                    {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.001},
-                ),
-                "grpo_sde_type": (["sde", "cps"], {"default": "sde"}),
-                "grpo_timestep_fraction": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01},
-                ),
             }
         }
 
@@ -725,194 +1097,27 @@ class AITKRLHFSession:
     def start_session(
         self,
         session_id: str,
-        model_preset: str,
-        use_preset_defaults: bool,
-        model_arch: str,
-        model_name: str,
-        model_extras_name_or_path: str,
-        model_quantize: str,
-        model_quantize_te: str,
-        model_qtype: str,
-        model_qtype_te: str,
-        model_low_vram: str,
-        model_layer_offloading: str,
-        model_layer_offloading_transformer_percent: float,
-        model_layer_offloading_text_encoder_percent: float,
-        model_attn_masking: str,
-        model_split_model_over_gpus: str,
-        model_assistant_lora_path: str,
-        model_accuracy_recovery_adapter: str,
-        model_match_target_res: str,
-        model_train_high_noise: str,
-        model_train_low_noise: str,
-        model_do_random_inpainting: str,
-        model_random_blur_mask: str,
-        model_random_dialate_mask: str,
-        model_invert_inpaint_mask_chance: float,
-        model_inpaint_dropout: float,
-        model_control_dropout: float,
-        model_inpaint_random_chance: float,
-        device: str,
-        dtype: str,
-        seed: int,
-        checkpoint_root: str,
-        checkpoint_interval_steps: int,
-        resume: bool,
+        config_json: str,
         force_reset: bool,
-        lora_rank: int,
-        lora_alpha: int,
-        lora_dropout: float,
-        lora_path: str,
-        learning_rate: float,
-        adam_beta1: float,
-        adam_beta2: float,
-        adam_weight_decay: float,
-        adam_epsilon: float,
-        max_grad_norm: float,
-        grpo_clip_range: float,
-        grpo_adv_clip_max: float,
-        grpo_beta: float,
-        grpo_noise_level: float,
-        grpo_sde_type: str,
-        grpo_timestep_fraction: float,
     ):
         _raise_if_unavailable()
         manager = get_online_flow_grpo_manager()
         normalized_session_id = session_id.strip()
-        model_config_overrides: dict[str, Any] = {}
-        model_kwargs: dict[str, Any] = {}
-        model_paths: dict[str, str] = {}
 
-        effective_model_arch = model_arch.strip()
-        effective_model_name = model_name.strip()
-        effective_model_extras = model_extras_name_or_path.strip() or None
+        try:
+            ui_state = json.loads(config_json) if str(config_json or "").strip() else _default_session_ui_state()
+        except Exception as error:
+            raise ValueError(f"Invalid session UI state JSON: {error}") from error
 
-        presets = _load_aitk_ui_model_presets()
-        preset = presets.get(model_preset, {})
-        if bool(use_preset_defaults) and model_preset != "custom":
-            preset_arch = preset.get("arch")
-            if isinstance(preset_arch, str) and preset_arch.strip():
-                effective_model_arch = preset_arch.strip()
-            preset_name = preset.get("name_or_path")
-            if isinstance(preset_name, str) and preset_name.strip():
-                effective_model_name = preset_name.strip()
-            preset_extras = preset.get("extras_name_or_path")
-            if isinstance(preset_extras, str) and preset_extras.strip():
-                effective_model_extras = preset_extras.strip()
-            preset_model_kwargs = preset.get("model_kwargs")
-            if isinstance(preset_model_kwargs, dict):
-                model_kwargs.update(preset_model_kwargs)
-            preset_model_paths = preset.get("model_paths")
-            if isinstance(preset_model_paths, dict):
-                model_paths.update({str(k): str(v) for k, v in preset_model_paths.items()})
-
-            for key in (
-                "quantize",
-                "quantize_te",
-                "qtype",
-                "qtype_te",
-                "low_vram",
-                "layer_offloading",
-                "attn_masking",
-                "split_model_over_gpus",
-                "assistant_lora_path",
-                "accuracy_recovery_adapter",
-            ):
-                if key in preset and preset[key] is not None:
-                    model_config_overrides[key] = preset[key]
-
-        if not effective_model_name:
-            raise ValueError("Model name is required. Set model_name or select a preset with defaults enabled.")
-
-        model_config_overrides["arch"] = effective_model_arch
-        model_config_overrides["name_or_path"] = effective_model_name
-        if effective_model_extras:
-            model_config_overrides["extras_name_or_path"] = effective_model_extras
-
-        def apply_tristate(target: dict[str, Any], key: str, mode: str) -> None:
-            parsed = _tristate_to_optional_bool(mode)
-            if parsed is not None:
-                target[key] = parsed
-
-        apply_tristate(model_config_overrides, "quantize", model_quantize)
-        apply_tristate(model_config_overrides, "quantize_te", model_quantize_te)
-        apply_tristate(model_config_overrides, "low_vram", model_low_vram)
-        apply_tristate(model_config_overrides, "layer_offloading", model_layer_offloading)
-        apply_tristate(model_config_overrides, "attn_masking", model_attn_masking)
-        apply_tristate(model_config_overrides, "split_model_over_gpus", model_split_model_over_gpus)
-
-        if model_qtype.strip():
-            model_config_overrides["qtype"] = model_qtype.strip()
-        if model_qtype_te.strip():
-            model_config_overrides["qtype_te"] = model_qtype_te.strip()
-        if model_assistant_lora_path.strip():
-            model_config_overrides["assistant_lora_path"] = model_assistant_lora_path.strip()
-        if model_accuracy_recovery_adapter.strip():
-            model_config_overrides["accuracy_recovery_adapter"] = model_accuracy_recovery_adapter.strip()
-
-        if bool(model_config_overrides.get("layer_offloading", False)):
-            model_config_overrides["layer_offloading_transformer_percent"] = float(
-                model_layer_offloading_transformer_percent
+        if not normalized_session_id:
+            job_name = (
+                (((ui_state.get("job_config") or {}).get("config") or {}).get("name"))
+                if isinstance(ui_state, dict)
+                else None
             )
-            model_config_overrides["layer_offloading_text_encoder_percent"] = float(
-                model_layer_offloading_text_encoder_percent
-            )
+            normalized_session_id = str(job_name or "aitk-session-1").strip()
 
-        apply_tristate(model_kwargs, "match_target_res", model_match_target_res)
-        apply_tristate(model_kwargs, "train_high_noise", model_train_high_noise)
-        apply_tristate(model_kwargs, "train_low_noise", model_train_low_noise)
-        apply_tristate(model_kwargs, "do_random_inpainting", model_do_random_inpainting)
-        apply_tristate(model_kwargs, "random_blur_mask", model_random_blur_mask)
-        apply_tristate(model_kwargs, "random_dialate_mask", model_random_dialate_mask)
-
-        if float(model_invert_inpaint_mask_chance) >= 0.0:
-            model_kwargs["invert_inpaint_mask_chance"] = float(model_invert_inpaint_mask_chance)
-        if float(model_inpaint_dropout) >= 0.0:
-            model_kwargs["inpaint_dropout"] = float(model_inpaint_dropout)
-        if float(model_control_dropout) >= 0.0:
-            model_kwargs["control_dropout"] = float(model_control_dropout)
-        if float(model_inpaint_random_chance) >= 0.0:
-            model_kwargs["inpaint_random_chance"] = float(model_inpaint_random_chance)
-
-        config = SessionConfig(
-            session_id=normalized_session_id,
-            model_arch=effective_model_arch,
-            model_name=effective_model_name,
-            model_extras_name_or_path=effective_model_extras or None,
-            model_kwargs=model_kwargs,
-            model_paths=model_paths,
-            model_config_overrides=model_config_overrides,
-            device=device.strip(),
-            dtype=dtype,  # type: ignore[arg-type]
-            seed=int(seed),
-            checkpoint_root=checkpoint_root.strip(),
-            checkpoint_interval_steps=int(checkpoint_interval_steps),
-            resume=bool(resume),
-            lora=LoRAConfigSpec(
-                enabled=True,
-                rank=int(lora_rank),
-                alpha=int(lora_alpha),
-                dropout=float(lora_dropout),
-                lora_path=lora_path.strip() or None,
-            ),
-            optimizer=OptimizerConfig(
-                optimizer="adamw",
-                learning_rate=float(learning_rate),
-                adam_beta1=float(adam_beta1),
-                adam_beta2=float(adam_beta2),
-                adam_weight_decay=float(adam_weight_decay),
-                adam_epsilon=float(adam_epsilon),
-                max_grad_norm=float(max_grad_norm),
-            ),
-            grpo=GRPOConfig(
-                clip_range=float(grpo_clip_range),
-                adv_clip_max=float(grpo_adv_clip_max),
-                beta=float(grpo_beta),
-                noise_level=float(grpo_noise_level),
-                sde_type=grpo_sde_type,  # type: ignore[arg-type]
-                timestep_fraction=float(grpo_timestep_fraction),
-            ),
-        )
+        config = _build_session_config_from_ui_state(normalized_session_id, ui_state)
         try:
             session = manager.create_or_get_session(config, force_reset=bool(force_reset))
             summary = session.summary()
@@ -929,20 +1134,19 @@ class AITKRLHFSession:
                 message=status,
                 payload={
                     "force_reset": bool(force_reset),
-                    "resume": bool(resume),
-                    "model_preset": model_preset,
-                    "model_arch": effective_model_arch,
-                    "model_name": effective_model_name,
+                    "resume": bool(config.resume),
+                    "model_arch": config.model_arch,
+                    "model_name": config.model_name,
                 },
             )
-            return (session_id, status)
+            return (normalized_session_id, status)
         except Exception as error:
             _append_session_log(
                 normalized_session_id,
                 event="session_error",
                 level="error",
                 message=f"Session creation failed: {error}",
-                payload={"force_reset": bool(force_reset), "resume": bool(resume)},
+                payload={"force_reset": bool(force_reset), "resume": bool(config.resume)},
             )
             raise
 
